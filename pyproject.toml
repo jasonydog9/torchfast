@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "torch>=2.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "torchfast"
+version = "0.1.0"
+description = "Custom C++ PyTorch kernels measurably faster than PyTorch defaults"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = ["torch>=2.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "pytest-benchmark"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["torchfast*"]

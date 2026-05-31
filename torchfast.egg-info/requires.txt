@@ -1,0 +1,5 @@
+torch>=2.0
+
+[dev]
+pytest>=7
+pytest-benchmark
