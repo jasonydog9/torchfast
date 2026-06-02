@@ -60,17 +60,23 @@ class _FusedLinearActFn(Function):
     @staticmethod
     def forward(ctx, input, weight, bias, activation):
         ext = _get_fused_linear()
-        out = ext.forward(input, weight, bias, activation)
-        ctx.save_for_backward(input, weight, bias)
+        # C++ forward now returns (out, pre_act).
+        # pre_act = X @ W.T + b  BEFORE activation — saved here so backward
+        # never has to recompute the BLAS call.  Costs one extra [N,M] clone
+        # in forward; saves a full BLAS GEMM (~3-4ms) per backward call.
+        out, pre_act = ext.forward(input, weight, bias, activation)
+        ctx.save_for_backward(input, weight, pre_act)
         ctx.activation = activation
         return out
 
     @staticmethod
     def backward(ctx, grad_out):
-        input, weight, bias = ctx.saved_tensors
+        input, weight, pre_act = ctx.saved_tensors
         ext = _get_fused_linear()
+        # New backward signature: (grad_out, pre_act, input, weight, act)
+        # pre_act replaces the old (input, weight, bias) recompute path.
         g_in, g_w, g_b = ext.backward(
-            grad_out.contiguous(), input, weight, bias, ctx.activation
+            grad_out.contiguous(), pre_act, input, weight, ctx.activation
         )
         return g_in, g_w, g_b, None
 

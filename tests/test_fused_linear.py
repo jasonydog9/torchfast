@@ -31,10 +31,15 @@ def test_forward_correctness(act, N, K, M):
     w = torch.randn(M, K)
     b = torch.randn(M)
 
-    got = ext.forward(x, w, b, act)
+    # forward now returns (out, pre_act) — unpack and check just the output
+    out, pre_act = ext.forward(x, w, b, act)
     ref = _ref_forward(x, w, b, act)
 
-    torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-4)
+
+    # Also verify that pre_act is the linear output BEFORE activation
+    ref_pre = F.linear(x, w, b)
+    torch.testing.assert_close(pre_act, ref_pre, rtol=1e-4, atol=1e-4)
 
 
 @pytest.mark.parametrize("act", ["gelu", "relu", "silu"])
@@ -45,7 +50,9 @@ def test_backward_correctness(act):
     b  = torch.randn(M,    requires_grad=False)
     go = torch.randn(N, M)
 
-    gi, gw, gb = ext.backward(go, x, w, b, act)
+    # Use the new API: forward returns (out, pre_act); backward takes pre_act
+    _, pre_act = ext.forward(x, w, b, act)
+    gi, gw, gb = ext.backward(go, pre_act, x, w, act)
 
     # Reference via autograd
     xr = x.clone().requires_grad_(True)
@@ -75,7 +82,7 @@ def test_batch_size_one():
     x = torch.randn(1, 64)
     w = torch.randn(32, 64)
     b = torch.randn(32)
-    out = ext.forward(x, w, b, "gelu")
+    out, _ = ext.forward(x, w, b, "gelu")
     assert out.shape == (1, 32)
 
 
@@ -83,7 +90,7 @@ def test_large_tensor():
     x = torch.randn(1024, 2048)
     w = torch.randn(2048, 2048)
     b = torch.randn(2048)
-    out = ext.forward(x, w, b, "silu")
+    out, _ = ext.forward(x, w, b, "silu")
     assert out.shape == (1024, 2048)
 
 

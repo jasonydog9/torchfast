@@ -1,0 +1,21 @@
+# ninja log v7
+0	5390	1780259879849819986	/Users/jasonyap/torchfast/build/temp.macosx-14.6-arm64-cpython-310/csrc/fused_linear_act.o	ffe4686c489f9ea8
+1	5000	1780259885333340973	/Users/jasonyap/torchfast/build/temp.macosx-14.6-arm64-cpython-310/csrc/normalization.o	7d83822a7af69153
+1	4959	1780259890411981980	/Users/jasonyap/torchfast/build/temp.macosx-14.6-arm64-cpython-310/csrc/attention.o	404b05df8f4b0da
+1	5005	1780259895451315382	/Users/jasonyap/torchfast/build/temp.macosx-14.6-arm64-cpython-310/csrc/losses.o	b71c877da3c2fff
+3	4969	1780260301913588638	/Users/jasonyap/torchfast/build/temp.macosx-14.6-arm64-cpython-310/csrc/fused_linear_act.o	9409634f0b7f3b8
+4	4924	1780260306971706371	/Users/jasonyap/torchfast/build/temp.macosx-14.6-arm64-cpython-310/csrc/normalization.o	ee3576c8e81431c
+4	4830	1780260311975942180	/Users/jasonyap/torchfast/build/temp.macosx-14.6-arm64-cpython-310/csrc/attention.o	fa35e872271c6673
+4	4875	1780260316886857612	/Users/jasonyap/torchfast/build/temp.macosx-14.6-arm64-cpython-310/csrc/losses.o	3427d1bc0e2bb5ea
+4	5165	1780260344532169276	/Users/jasonyap/torchfast/build/temp.macosx-14.6-arm64-cpython-310/csrc/fused_linear_act.o	b30da948b84a908c
+5	5199	1780260349790001891	/Users/jasonyap/torchfast/build/temp.macosx-14.6-arm64-cpython-310/csrc/normalization.o	fa3d3b25a1b9a1d3
+6	5071	1780260355069148597	/Users/jasonyap/torchfast/build/temp.macosx-14.6-arm64-cpython-310/csrc/attention.o	8a076825fca7129c
+5	5003	1780260360220839875	/Users/jasonyap/torchfast/build/temp.macosx-14.6-arm64-cpython-310/csrc/losses.o	dc8eb8f71a6ff29
+5	5045	1780261097492523487	/Users/jasonyap/torchfast/build/temp.macosx-14.6-arm64-cpython-310/csrc/fused_linear_act.o	9f2ad53f16b3fbc3
+6	4948	1780261102628917873	/Users/jasonyap/torchfast/build/temp.macosx-14.6-arm64-cpython-310/csrc/normalization.o	18bab1770ce02911
+6	4854	1780261107656708471	/Users/jasonyap/torchfast/build/temp.macosx-14.6-arm64-cpython-310/csrc/attention.o	dd7235aa6a76c55a
+6	4904	1780261112591783644	/Users/jasonyap/torchfast/build/temp.macosx-14.6-arm64-cpython-310/csrc/losses.o	bdb8ffd17f122a8a
+7	5489	1780429592604386278	/Users/jasonyap/torchfast/build/temp.macosx-14.6-arm64-cpython-310/csrc/fused_linear_act.o	30ca01f83b1081d6
+8	5085	1780429598251531681	/Users/jasonyap/torchfast/build/temp.macosx-14.6-arm64-cpython-310/csrc/normalization.o	47210243e08f49aa
+7	4843	1780429603417168417	/Users/jasonyap/torchfast/build/temp.macosx-14.6-arm64-cpython-310/csrc/attention.o	2af470242489b28
+7	4896	1780429608338698142	/Users/jasonyap/torchfast/build/temp.macosx-14.6-arm64-cpython-310/csrc/losses.o	7047cfbd1ac2c5e6
