@@ -77,6 +77,14 @@
 #include <cmath>
 #include <algorithm>  // std::max
 
+// Platform-specific SIMD.
+// On Apple Silicon (AArch64 NEON), we use explicit 4-way-unrolled intrinsics
+// to eliminate reduction dependency chains.  On x86, the auto-vectorized path
+// below is used (the compiler generates SSE/AVX from the scalar loops).
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
+
 
 // ─── FORWARD PASS ─────────────────────────────────────────────────────────────
 /*
@@ -129,56 +137,106 @@ layer_norm_forward(
     // ── Parallel loop: each sample i is fully independent ────────────────────
     at::parallel_for(0, N, 0, [&](int64_t begin, int64_t end) {
         for (int64_t i = begin; i < end; ++i) {
-            const float* row = inp + i * C;  // pointer to input sample i
-            float*       dst = o   + i * C;  // pointer to output sample i
+            const float* row = inp + i * C;
+            float*       dst = o   + i * C;
 
-            // ── Fused Pass 1: mean AND variance in a single loop ──────────────
+            // ── Pass 1: fused mean + variance ─────────────────────────────────
             //
-            // ALGORITHM: accumulate sum=Σx and sq_sum=Σx² simultaneously.
-            //   mean = sum / C
-            //   var  = sq_sum/C - mean²     (Var(X) = E[X²] - E[X]²)
+            // ROOT CAUSE OF THE (1024,2048) SLOWNESS:
+            // Auto-vectorized reductions use a SINGLE accumulator register:
+            //   vsum = vsum + vload(row+c)    ← each iteration depends on previous
+            // NEON VADD has 3-4 cycle latency, so the CPU stalls waiting for the
+            // result before starting the next iteration. The loop is LATENCY-BOUND.
             //
-            // WHY THIS IS VECTORIZABLE (unlike Welford):
-            //   sum    += row[c]           ← no dependency between iterations
-            //   sq_sum += row[c] * row[c]  ← no dependency between iterations
-            //
-            // The compiler can issue these as two parallel SIMD reduction chains:
-            //   vsum   = vadd(vsum,   vload(row + c))    ; 8 floats at once (NEON/AVX2)
-            //   vsqsum = vfma(vsqsum, vload(row+c), vload(row+c))
-            //
-            // Old v1 had two sequential loops over C (one for mean, one for var).
-            // This fused loop reads each element ONCE → saves one full row read.
-            // For C=2048 (8KB/row): saves 8KB of cache/memory reads per sample.
-            float sum    = 0.0f;
-            float sq_sum = 0.0f;
-            for (int64_t c = 0; c < C; ++c) {
-                float x  = row[c];
-                sum    += x;
-                sq_sum += x * x;
+            // Fix: 4 independent accumulator registers (s0,s1,s2,s3) + (q0,q1,q2,q3).
+            // Now iterations over s0 have NO dependency on s1/s2/s3, so all 4 chains
+            // advance simultaneously. With 2 NEON execute units, we fully saturate
+            // both at 2 ops/cycle instead of 1 op per 4 cycles.
+            // Speedup on the reduction: ~3-4x.
+            float sum = 0.0f, sq_sum = 0.0f;
+
+#ifdef __ARM_NEON
+            // 4-way unrolled NEON: 16 floats per outer iteration, 8 independent registers.
+            {
+                float32x4_t s0=vdupq_n_f32(0), s1=vdupq_n_f32(0),
+                            s2=vdupq_n_f32(0), s3=vdupq_n_f32(0);
+                float32x4_t q0=vdupq_n_f32(0), q1=vdupq_n_f32(0),
+                            q2=vdupq_n_f32(0), q3=vdupq_n_f32(0);
+
+                int64_t c = 0;
+                for (; c + 16 <= C; c += 16) {
+                    // Load 16 consecutive floats into 4 NEON registers (4 floats each)
+                    float32x4_t x0 = vld1q_f32(row + c);
+                    float32x4_t x1 = vld1q_f32(row + c + 4);
+                    float32x4_t x2 = vld1q_f32(row + c + 8);
+                    float32x4_t x3 = vld1q_f32(row + c + 12);
+                    // Accumulate sum: 4 independent chains → no stall
+                    s0 = vaddq_f32(s0, x0);  s1 = vaddq_f32(s1, x1);
+                    s2 = vaddq_f32(s2, x2);  s3 = vaddq_f32(s3, x3);
+                    // Accumulate sum-of-squares via FMA: q += x*x
+                    q0 = vfmaq_f32(q0, x0, x0);  q1 = vfmaq_f32(q1, x1, x1);
+                    q2 = vfmaq_f32(q2, x2, x2);  q3 = vfmaq_f32(q3, x3, x3);
+                }
+                // Tree-reduce 4 → 2 → 1 NEON register, then horizontal sum
+                s0 = vaddq_f32(vaddq_f32(s0, s1), vaddq_f32(s2, s3));
+                q0 = vaddq_f32(vaddq_f32(q0, q1), vaddq_f32(q2, q3));
+                sum    = vaddvq_f32(s0);  // 4-lane horizontal sum (AArch64)
+                sq_sum = vaddvq_f32(q0);
+                // Scalar cleanup for remaining elements (C not multiple of 16)
+                for (; c < C; ++c) { sum += row[c]; sq_sum += row[c] * row[c]; }
             }
+#else
+            // Portable auto-vectorized path (x86 SSE/AVX, non-NEON ARM)
+            for (int64_t c = 0; c < C; ++c) {
+                float x = row[c]; sum += x; sq_sum += x * x;
+            }
+#endif
 
             float mu  = sum * inv_C;
-
-            // Var(X) = E[X²] - E[X]²
-            // std::max(0, ...) guards against tiny negative values from
-            // floating-point rounding (e.g. var=-1e-8 when all inputs are equal).
-            // Without this, std::sqrt(negative) = NaN.
+            // Var(X) = E[X²] - E[X]².  std::max(0) guards against -ε rounding.
             float var = std::max(0.0f, sq_sum * inv_C - mu * mu);
-
-            // rstd = 1 / sqrt(σ² + ε).  Store reciprocal to use multiply in backward.
-            float rs = 1.0f / std::sqrt(var + eps);
-
-            // Save per-sample statistics for the backward pass.
+            float rs  = 1.0f / std::sqrt(var + eps);
             m[i] = mu;
             r[i] = rs;
 
-            // ── Pass 2: Normalize + affine transform ──────────────────────────
-            // Fused: y_c = (x_c - μ) * rstd * γ_c + β_c
-            // Reads: row[c], w[c], b[c]. Writes: dst[c].
-            // No intermediate x̂ tensor — stays in registers.
+            // ── Pass 2: normalize + affine ────────────────────────────────────
+            // Same 4-way unrolling for the normalize loop.
+            // Each of the 4 groups (x0,w0,b0), (x1,w1,b1), ... is independent,
+            // so the 4 FMA computations can all be in flight simultaneously.
+
+#ifdef __ARM_NEON
+            {
+                float32x4_t vmu = vdupq_n_f32(mu);  // broadcast scalar to NEON
+                float32x4_t vrs = vdupq_n_f32(rs);
+
+                int64_t c = 0;
+                for (; c + 16 <= C; c += 16) {
+                    // Load input, weight, bias for 16 elements (4 groups of 4)
+                    float32x4_t x0=vld1q_f32(row+c),   x1=vld1q_f32(row+c+4),
+                                x2=vld1q_f32(row+c+8),  x3=vld1q_f32(row+c+12);
+                    float32x4_t w0=vld1q_f32(w+c),     w1=vld1q_f32(w+c+4),
+                                w2=vld1q_f32(w+c+8),    w3=vld1q_f32(w+c+12);
+                    float32x4_t b0=vld1q_f32(b+c),     b1=vld1q_f32(b+c+4),
+                                b2=vld1q_f32(b+c+8),    b3=vld1q_f32(b+c+12);
+                    // n_i = (x_i - mu) * rs          (normalized, pre-affine)
+                    float32x4_t n0=vmulq_f32(vsubq_f32(x0,vmu),vrs);
+                    float32x4_t n1=vmulq_f32(vsubq_f32(x1,vmu),vrs);
+                    float32x4_t n2=vmulq_f32(vsubq_f32(x2,vmu),vrs);
+                    float32x4_t n3=vmulq_f32(vsubq_f32(x3,vmu),vrs);
+                    // y_i = b_i + n_i * w_i           (VFMA: 1 instruction)
+                    vst1q_f32(dst+c,    vfmaq_f32(b0, n0, w0));
+                    vst1q_f32(dst+c+4,  vfmaq_f32(b1, n1, w1));
+                    vst1q_f32(dst+c+8,  vfmaq_f32(b2, n2, w2));
+                    vst1q_f32(dst+c+12, vfmaq_f32(b3, n3, w3));
+                }
+                // Scalar cleanup
+                for (; c < C; ++c) dst[c] = (row[c] - mu) * rs * w[c] + b[c];
+            }
+#else
             for (int64_t c = 0; c < C; ++c) {
                 dst[c] = (row[c] - mu) * rs * w[c] + b[c];
             }
+#endif
         }
     });
 

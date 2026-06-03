@@ -213,10 +213,58 @@ fused_linear_act_backward(
 }
 
 
+// ─── INFERENCE-ONLY FORWARD ──────────────────────────────────────────────────
+/*
+ * Fast path for inference / torch.no_grad() contexts.
+ *
+ * The training forward (above) always calls pre_act.clone() to save the
+ * pre-activation values for backward. This clone allocates a fresh [N,M]
+ * tensor and copies 8MB (at large shapes) — pure waste when backward
+ * will never run.
+ *
+ * This function skips the clone entirely:
+ *   addmm → BLAS output → apply activation in-place → return output
+ *
+ * Memory savings vs training forward: 1 allocation + 1 memcpy of [N,M].
+ * For (32, 256): ~32KB → reduces kernel overhead by ~5μs.
+ * For (1024, 2048): ~8MB → reduces overhead by ~0.16ms.
+ */
+torch::Tensor fused_linear_act_inference(
+    const torch::Tensor& input,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    const std::string&   act)
+{
+    TORCH_CHECK(input.dim() == 2,  "input must be 2D");
+    TORCH_CHECK(weight.dim() == 2, "weight must be 2D");
+    TORCH_CHECK(bias.dim() == 1,   "bias must be 1D");
+    TORCH_CHECK(input.is_contiguous(),  "input must be contiguous");
+    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
+    TORCH_CHECK(bias.is_contiguous(),   "bias must be contiguous");
+    TORCH_CHECK(input.scalar_type()  == torch::kFloat32, "input must be float32");
+    TORCH_CHECK(weight.scalar_type() == torch::kFloat32, "weight must be float32");
+    TORCH_CHECK(bias.scalar_type()   == torch::kFloat32, "bias must be float32");
+    TORCH_CHECK(weight.size(1) == input.size(1), "weight inner dim must match input features");
+    TORCH_CHECK(bias.size(0)   == weight.size(0), "bias size must match out_features");
+    TORCH_CHECK(act == "gelu" || act == "relu" || act == "silu",
+                "act must be 'gelu', 'relu', or 'silu'");
+
+    auto out = torch::addmm(bias, input, weight.t());  // BLAS
+
+    if (act == "gelu") at::gelu_(out, "tanh");
+    else if (act == "relu") at::relu_(out);
+    else at::silu_(out);
+
+    return out;  // single tensor, no pre_act saved
+}
+
+
 // ─── Python bindings ─────────────────────────────────────────────────────────
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("forward",  &fused_linear_act_forward,
-          "Fused Linear+Activation forward — returns (output, pre_act)");
-    m.def("backward", &fused_linear_act_backward,
-          "Fused Linear+Activation backward — takes pre_act, no BLAS recompute");
+    m.def("forward",           &fused_linear_act_forward,
+          "Training forward — returns (output, pre_act) for backward reuse");
+    m.def("inference_forward", &fused_linear_act_inference,
+          "Inference forward — no clone, no pre_act, fastest path");
+    m.def("backward",          &fused_linear_act_backward,
+          "Backward — takes saved pre_act, no BLAS recompute");
 }

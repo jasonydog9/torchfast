@@ -60,12 +60,21 @@ class _FusedLinearActFn(Function):
     @staticmethod
     def forward(ctx, input, weight, bias, activation):
         ext = _get_fused_linear()
-        # C++ forward now returns (out, pre_act).
-        # pre_act = X @ W.T + b  BEFORE activation — saved here so backward
-        # never has to recompute the BLAS call.  Costs one extra [N,M] clone
-        # in forward; saves a full BLAS GEMM (~3-4ms) per backward call.
-        out, pre_act = ext.forward(input, weight, bias, activation)
-        ctx.save_for_backward(input, weight, pre_act)
+        # Choose the fast path based on whether backward will actually run.
+        # torch.is_grad_enabled() is False inside torch.no_grad() blocks.
+        #
+        # Inference path: addmm + in-place activation, NO clone.
+        #   No pre_act saved → backward cannot be called → correct for no_grad.
+        #
+        # Training path: addmm + clone + in-place activation.
+        #   Saves pre_act in ctx so backward avoids recomputing the BLAS call.
+        #   Extra cost: one [N,M] clone per forward call.
+        #   Saved cost: one [N,M] BLAS GEMM per backward call (~20x the clone).
+        if torch.is_grad_enabled():
+            out, pre_act = ext.forward(input, weight, bias, activation)
+            ctx.save_for_backward(input, weight, pre_act)
+        else:
+            out = ext.inference_forward(input, weight, bias, activation)
         ctx.activation = activation
         return out
 
@@ -73,8 +82,6 @@ class _FusedLinearActFn(Function):
     def backward(ctx, grad_out):
         input, weight, pre_act = ctx.saved_tensors
         ext = _get_fused_linear()
-        # New backward signature: (grad_out, pre_act, input, weight, act)
-        # pre_act replaces the old (input, weight, bias) recompute path.
         g_in, g_w, g_b = ext.backward(
             grad_out.contiguous(), pre_act, input, weight, ctx.activation
         )
@@ -95,12 +102,17 @@ class FusedLinear(nn.Module):
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return _FusedLinearActFn.apply(
-            x.contiguous().float(),
-            self.weight.contiguous().float(),
-            self.bias.contiguous().float(),
-            self.activation,
-        )
+        xf = x.contiguous().float()
+        wf = self.weight.contiguous().float()
+        bf = self.bias.contiguous().float()
+        # Bypass autograd.Function.apply() entirely for inference.
+        # Function.apply() always runs the autograd engine even inside no_grad:
+        # it creates a FunctionCtx, wraps tensors, and checks grad tracking.
+        # For a tiny (32×256) tensor where total runtime is ~35μs, this overhead
+        # is a measurable fraction. A direct C++ call skips all of that.
+        if not torch.is_grad_enabled():
+            return _get_fused_linear().inference_forward(xf, wf, bf, self.activation)
+        return _FusedLinearActFn.apply(xf, wf, bf, self.activation)
 
     def extra_repr(self):
         return f"in={self.in_features}, out={self.out_features}, act={self.activation}"
