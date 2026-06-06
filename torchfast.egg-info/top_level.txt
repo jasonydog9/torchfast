@@ -1,5 +1,6 @@
 fast_attention
 fast_normalization
+fast_normalization_mps
 focal_loss
 fused_linear_act
 torchfast

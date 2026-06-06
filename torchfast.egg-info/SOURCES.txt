@@ -5,6 +5,7 @@ csrc/attention.cpp
 csrc/fused_linear_act.cpp
 csrc/losses.cpp
 csrc/normalization.cpp
+csrc/normalization_mps.mm
 tests/test_attention.py
 tests/test_fused_linear.py
 tests/test_losses.py

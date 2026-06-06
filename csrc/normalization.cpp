@@ -206,8 +206,21 @@ layer_norm_forward(
 
 #ifdef __ARM_NEON
             {
-                float32x4_t vmu = vdupq_n_f32(mu);  // broadcast scalar to NEON
-                float32x4_t vrs = vdupq_n_f32(rs);
+                float32x4_t vrs        = vdupq_n_f32(rs);
+                // Key optimization: replace vsub(x,mu) + vmul(result,rs) with a
+                // single FMA using the identity: (x - mu)*rs = x*rs + (-mu*rs).
+                //
+                // Old: n = vmulq(vsubq(x, vmu), vrs)   ← VSUB + VMUL, 2 instructions,
+                //           vsubq must complete before vmulq can start (2-cycle chain)
+                //
+                // New: n = vfmaq(vneg_murs, x, vrs)    ← single VFMA instruction
+                //   where vneg_murs = -mu * rs  (precomputed once, outside loop)
+                //   vfmaq(a, b, c) = a + b*c
+                //   so: vneg_murs + x*rs = -mu*rs + x*rs = (x-mu)*rs  ✓
+                //
+                // Saves 4 instructions per 16 elements (VSUB eliminated for all 4 groups).
+                // For C=2048: saves 2048/16 × 4 = 512 arithmetic instructions per row.
+                float32x4_t vneg_murs  = vdupq_n_f32(-mu * rs);  // -mu*rs, same all cols
 
                 int64_t c = 0;
                 for (; c + 16 <= C; c += 16) {
@@ -218,18 +231,18 @@ layer_norm_forward(
                                 w2=vld1q_f32(w+c+8),    w3=vld1q_f32(w+c+12);
                     float32x4_t b0=vld1q_f32(b+c),     b1=vld1q_f32(b+c+4),
                                 b2=vld1q_f32(b+c+8),    b3=vld1q_f32(b+c+12);
-                    // n_i = (x_i - mu) * rs          (normalized, pre-affine)
-                    float32x4_t n0=vmulq_f32(vsubq_f32(x0,vmu),vrs);
-                    float32x4_t n1=vmulq_f32(vsubq_f32(x1,vmu),vrs);
-                    float32x4_t n2=vmulq_f32(vsubq_f32(x2,vmu),vrs);
-                    float32x4_t n3=vmulq_f32(vsubq_f32(x3,vmu),vrs);
-                    // y_i = b_i + n_i * w_i           (VFMA: 1 instruction)
+                    // n_i = x_i * rs + (-mu*rs) = (x_i - mu)*rs   (single FMA)
+                    float32x4_t n0=vfmaq_f32(vneg_murs, x0, vrs);
+                    float32x4_t n1=vfmaq_f32(vneg_murs, x1, vrs);
+                    float32x4_t n2=vfmaq_f32(vneg_murs, x2, vrs);
+                    float32x4_t n3=vfmaq_f32(vneg_murs, x3, vrs);
+                    // y_i = b_i + n_i * w_i   (second FMA)
                     vst1q_f32(dst+c,    vfmaq_f32(b0, n0, w0));
                     vst1q_f32(dst+c+4,  vfmaq_f32(b1, n1, w1));
                     vst1q_f32(dst+c+8,  vfmaq_f32(b2, n2, w2));
                     vst1q_f32(dst+c+12, vfmaq_f32(b3, n3, w3));
                 }
-                // Scalar cleanup
+                // Scalar cleanup for C not a multiple of 16
                 for (; c < C; ++c) dst[c] = (row[c] - mu) * rs * w[c] + b[c];
             }
 #else
@@ -241,6 +254,111 @@ layer_norm_forward(
     });
 
     return {out, mean, rstd};
+}
+
+
+// ─── INFERENCE FORWARD (no mean/rstd output) ─────────────────────────────────
+/*
+ * Faster path for inference (torch.no_grad()) — returns only the output tensor.
+ *
+ * The training forward allocates and fills mean[N] and rstd[N], saves them as
+ * output tensors, then returns a 3-tuple. In Python, no_grad() discards them:
+ *   out, _, _ = ext.forward(x, w, b, eps)   ← 2 wasted allocations + writes + unpacks
+ *
+ * This function:
+ *   - Skips allocating mean and rstd entirely (saves 2 × N × 4 bytes of allocation)
+ *   - Returns a single tensor (no Python tuple overhead)
+ *   - Uses the identical NEON/scalar inner loops as training forward
+ *
+ * For N=1024: saves ~8KB of writes + 2 tensor allocations + Python tuple unpack.
+ * Small savings individually, but adds up over many calls in inference loops.
+ */
+torch::Tensor layer_norm_inference(
+    const torch::Tensor& input,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    float eps)
+{
+    TORCH_CHECK(input.dim() == 2,   "input must be 2D");
+    TORCH_CHECK(input.is_contiguous(),  "input must be contiguous");
+    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
+    TORCH_CHECK(bias.is_contiguous(),   "bias must be contiguous");
+    TORCH_CHECK(input.scalar_type() == torch::kFloat32, "input must be float32");
+
+    const int64_t N = input.size(0);
+    const int64_t C = input.size(1);
+    const float inv_C = 1.0f / static_cast<float>(C);
+
+    auto out = torch::empty_like(input);
+
+    const float* __restrict__ inp = input.data_ptr<float>();
+    const float* __restrict__ w   = weight.data_ptr<float>();
+    const float* __restrict__ b   = bias.data_ptr<float>();
+    float*       __restrict__ o   = out.data_ptr<float>();
+
+    at::parallel_for(0, N, 0, [&](int64_t begin, int64_t end) {
+        for (int64_t i = begin; i < end; ++i) {
+            const float* row = inp + i * C;
+            float*       dst = o   + i * C;
+
+            float sum = 0.0f, sq_sum = 0.0f;
+#ifdef __ARM_NEON
+            {
+                float32x4_t s0=vdupq_n_f32(0), s1=vdupq_n_f32(0),
+                            s2=vdupq_n_f32(0), s3=vdupq_n_f32(0);
+                float32x4_t q0=vdupq_n_f32(0), q1=vdupq_n_f32(0),
+                            q2=vdupq_n_f32(0), q3=vdupq_n_f32(0);
+                int64_t c = 0;
+                for (; c + 16 <= C; c += 16) {
+                    float32x4_t x0=vld1q_f32(row+c),   x1=vld1q_f32(row+c+4),
+                                x2=vld1q_f32(row+c+8),  x3=vld1q_f32(row+c+12);
+                    s0=vaddq_f32(s0,x0); s1=vaddq_f32(s1,x1);
+                    s2=vaddq_f32(s2,x2); s3=vaddq_f32(s3,x3);
+                    q0=vfmaq_f32(q0,x0,x0); q1=vfmaq_f32(q1,x1,x1);
+                    q2=vfmaq_f32(q2,x2,x2); q3=vfmaq_f32(q3,x3,x3);
+                }
+                s0=vaddq_f32(vaddq_f32(s0,s1),vaddq_f32(s2,s3));
+                q0=vaddq_f32(vaddq_f32(q0,q1),vaddq_f32(q2,q3));
+                sum=vaddvq_f32(s0); sq_sum=vaddvq_f32(q0);
+                for (; c < C; ++c) { sum+=row[c]; sq_sum+=row[c]*row[c]; }
+            }
+#else
+            for (int64_t c = 0; c < C; ++c) { float x=row[c]; sum+=x; sq_sum+=x*x; }
+#endif
+            float mu  = sum * inv_C;
+            float var = std::max(0.0f, sq_sum * inv_C - mu * mu);
+            float rs  = 1.0f / std::sqrt(var + eps);
+            // No m[i]/r[i] writes — that's the whole point of this function
+
+#ifdef __ARM_NEON
+            {
+                float32x4_t vrs       = vdupq_n_f32(rs);
+                float32x4_t vneg_murs = vdupq_n_f32(-mu * rs);
+                int64_t c = 0;
+                for (; c + 16 <= C; c += 16) {
+                    float32x4_t x0=vld1q_f32(row+c),   x1=vld1q_f32(row+c+4),
+                                x2=vld1q_f32(row+c+8),  x3=vld1q_f32(row+c+12);
+                    float32x4_t w0=vld1q_f32(w+c),     w1=vld1q_f32(w+c+4),
+                                w2=vld1q_f32(w+c+8),    w3=vld1q_f32(w+c+12);
+                    float32x4_t b0=vld1q_f32(b+c),     b1=vld1q_f32(b+c+4),
+                                b2=vld1q_f32(b+c+8),    b3=vld1q_f32(b+c+12);
+                    float32x4_t n0=vfmaq_f32(vneg_murs,x0,vrs);
+                    float32x4_t n1=vfmaq_f32(vneg_murs,x1,vrs);
+                    float32x4_t n2=vfmaq_f32(vneg_murs,x2,vrs);
+                    float32x4_t n3=vfmaq_f32(vneg_murs,x3,vrs);
+                    vst1q_f32(dst+c,    vfmaq_f32(b0,n0,w0));
+                    vst1q_f32(dst+c+4,  vfmaq_f32(b1,n1,w1));
+                    vst1q_f32(dst+c+8,  vfmaq_f32(b2,n2,w2));
+                    vst1q_f32(dst+c+12, vfmaq_f32(b3,n3,w3));
+                }
+                for (; c < C; ++c) dst[c] = (row[c]-mu)*rs*w[c]+b[c];
+            }
+#else
+            for (int64_t c = 0; c < C; ++c) dst[c] = (row[c]-mu)*rs*w[c]+b[c];
+#endif
+        }
+    });
+    return out;
 }
 
 
@@ -377,6 +495,7 @@ layer_norm_backward(
 
 // ─── Python bindings ─────────────────────────────────────────────────────────
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("forward",  &layer_norm_forward,  "LayerNorm forward");
-    m.def("backward", &layer_norm_backward, "LayerNorm backward");
+    m.def("forward",           &layer_norm_forward,    "LayerNorm training forward (returns output + mean + rstd)");
+    m.def("inference_forward", &layer_norm_inference,  "LayerNorm inference forward (output only, no mean/rstd)");
+    m.def("backward",          &layer_norm_backward,   "LayerNorm backward");
 }

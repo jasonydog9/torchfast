@@ -20,6 +20,8 @@ def _load(name, src):
 
 _fused_linear_ext  = None
 _norm_ext          = None
+_norm_cuda_ext     = None
+_norm_mps_ext      = None
 _attention_ext     = None
 _focal_ext         = None
 
@@ -36,6 +38,34 @@ def _get_norm():
     if _norm_ext is None:
         _norm_ext = _load("fast_normalization", "normalization.cpp")
     return _norm_ext
+
+
+def _get_norm_cuda():
+    global _norm_cuda_ext
+    if _norm_cuda_ext is None:
+        try:
+            import fast_normalization_cuda
+            _norm_cuda_ext = fast_normalization_cuda
+        except ImportError:
+            raise RuntimeError(
+                "fast_normalization_cuda not built. "
+                "Run 'pip install .' on a machine with an NVIDIA GPU and CUDA toolkit."
+            )
+    return _norm_cuda_ext
+
+
+def _get_norm_mps():
+    global _norm_mps_ext
+    if _norm_mps_ext is None:
+        try:
+            import fast_normalization_mps
+            _norm_mps_ext = fast_normalization_mps
+        except ImportError:
+            raise RuntimeError(
+                "fast_normalization_mps not built. "
+                "Run 'pip install .' on macOS with Apple Silicon."
+            )
+    return _norm_mps_ext
 
 
 def _get_attention():
@@ -122,10 +152,31 @@ class FusedLinear(nn.Module):
 # FastLayerNorm
 # ---------------------------------------------------------------------------
 
+def _layernorm_backward_pytorch(grad_out, input, weight, mean, rstd, eps):
+    """Backward using PyTorch ops — auto-dispatches to any device (CPU/CUDA/MPS)."""
+    N, C = input.shape
+    mu = mean.unsqueeze(1)   # [N, 1]
+    rs = rstd.unsqueeze(1)   # [N, 1]
+    x_hat      = (input - mu) * rs                       # normalized input
+    grad_weight = (grad_out * x_hat).sum(0)               # [C]
+    grad_bias   = grad_out.sum(0)                         # [C]
+    dy_w = grad_out * weight                              # [N, C]
+    sum1 = dy_w.sum(-1, keepdim=True)                    # [N, 1]
+    sum2 = (dy_w * (input - mu)).sum(-1, keepdim=True)   # [N, 1]
+    grad_input  = rs * (dy_w - sum1/C - (input-mu) * rs*rs * sum2/C)
+    return grad_input, grad_weight, grad_bias
+
+
 class _LayerNormFn(Function):
     @staticmethod
     def forward(ctx, input, weight, bias, eps):
-        ext = _get_norm()
+        # Dispatch to CUDA, MPS, or CPU kernel based on input device.
+        if input.is_cuda:
+            ext = _get_norm_cuda()
+        elif input.device.type == "mps":
+            ext = _get_norm_mps()
+        else:
+            ext = _get_norm()
         out, mean, rstd = ext.forward(input, weight, bias, eps)
         ctx.save_for_backward(input, weight, mean, rstd)
         ctx.eps = eps
@@ -134,10 +185,20 @@ class _LayerNormFn(Function):
     @staticmethod
     def backward(ctx, grad_out):
         input, weight, mean, rstd = ctx.saved_tensors
-        ext = _get_norm()
-        g_in, g_w, g_b = ext.backward(
-            grad_out.contiguous(), input, weight, mean, rstd, ctx.eps
-        )
+        if input.is_cuda:
+            ext = _get_norm_cuda()
+            g_in, g_w, g_b = ext.backward(
+                grad_out.contiguous(), input, weight, mean, rstd, ctx.eps)
+        elif input.device.type == "mps":
+            # MPS backward uses PyTorch ops — they auto-dispatch to Metal GPU.
+            # A custom Metal backward kernel would be faster but adds complexity;
+            # for now, PyTorch's MPS ops (matmul, sum, etc.) are already GPU-accelerated.
+            g_in, g_w, g_b = _layernorm_backward_pytorch(
+                grad_out.contiguous(), input, weight, mean, rstd, ctx.eps)
+        else:
+            ext = _get_norm()
+            g_in, g_w, g_b = ext.backward(
+                grad_out.contiguous(), input, weight, mean, rstd, ctx.eps)
         return g_in, g_w, g_b, None
 
 
@@ -154,12 +215,23 @@ class FastLayerNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         shape = x.shape
         x2d = x.reshape(-1, self.features).contiguous().float()
-        out = _LayerNormFn.apply(
-            x2d,
-            self.weight.contiguous().float(),
-            self.bias.contiguous().float(),
-            self.eps,
-        )
+        w   = self.weight.contiguous().float()
+        b   = self.bias.contiguous().float()
+        if not torch.is_grad_enabled():
+            # Inference path: bypass autograd.Function.apply() entirely.
+            # Dispatch to the right backend based on device.
+            device_type = x2d.device.type
+            if device_type == "mps":
+                ext = _get_norm_mps()
+                out, _, _ = ext.forward(x2d, w, b, self.eps)
+            elif x2d.is_cuda:
+                ext = _get_norm_cuda()
+                out, _, _ = ext.forward(x2d, w, b, self.eps)
+            else:
+                # CPU: use inference_forward (no mean/rstd output, single tensor return)
+                out = _get_norm().inference_forward(x2d, w, b, self.eps)
+        else:
+            out = _LayerNormFn.apply(x2d, w, b, self.eps)
         return out.reshape(shape)
 
     def extra_repr(self):

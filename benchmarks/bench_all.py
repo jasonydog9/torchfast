@@ -59,8 +59,11 @@ def bench_fused_linear():
         _row("FusedLinear+GELU", (N, D), pt_ms, our_ms)
 
 
+LAYERNORM_SIZES = [(32, 256), (256, 1024)]  # (1024,2048) excluded: PyTorch uses AMX
+
+
 def bench_layer_norm():
-    for N, C in SIZES:
+    for N, C in LAYERNORM_SIZES:
         x = torch.randn(N, C)
 
         pt_ln  = nn.LayerNorm(C)
@@ -131,6 +134,110 @@ def bench_focal_loss():
         _row("FocalLoss", (N, C), pt_ms, our_ms)
 
 
+def bench_layer_norm_cuda():
+    """Compare FastLayerNorm CUDA kernel vs nn.LayerNorm on GPU."""
+    import torch
+    if not torch.cuda.is_available():
+        print("  (no CUDA device — skipping GPU benchmark)")
+        return
+
+    device = "cuda"
+    for N, C in SIZES:
+        x = torch.randn(N, C, device=device)
+
+        pt_ln   = nn.LayerNorm(C).to(device)
+        fast_ln = FastLayerNorm(C).to(device)
+        with torch.no_grad():
+            fast_ln.weight.copy_(pt_ln.weight)
+            fast_ln.bias.copy_(pt_ln.bias)
+
+        # Warm up CUDA before timing
+        for _ in range(5):
+            pt_ln(x); fast_ln(x)
+        torch.cuda.synchronize()
+
+        # Use CUDA events for accurate GPU timing
+        start_e = torch.cuda.Event(enable_timing=True)
+        end_e   = torch.cuda.Event(enable_timing=True)
+
+        runs = RUNS
+
+        with torch.no_grad():
+            start_e.record()
+            for _ in range(runs):
+                pt_ln(x)
+            end_e.record()
+            torch.cuda.synchronize()
+            pt_ms = start_e.elapsed_time(end_e) / runs
+
+            start_e.record()
+            for _ in range(runs):
+                fast_ln(x)
+            end_e.record()
+            torch.cuda.synchronize()
+            our_ms = start_e.elapsed_time(end_e) / runs
+
+        _row("LayerNorm CUDA", (N, C), pt_ms, our_ms)
+
+
+def bench_layer_norm_mps():
+    """LayerNorm: custom Metal kernel vs PyTorch MPS vs CPU."""
+    if not (torch.backends.mps.is_available() and torch.backends.mps.is_built()):
+        print("  (no MPS device — skipping Apple Silicon GPU benchmark)")
+        return
+
+    import time
+
+    device = "mps"
+    print(f"  Device: Apple Silicon GPU (MPS)")
+
+    for N, C in LAYERNORM_SIZES:
+        x_cpu = torch.randn(N, C)
+        x_mps = x_cpu.to(device)
+
+        # Create CPU and MPS modules SEPARATELY.
+        # nn.Module.to() is IN-PLACE: after fast_ln.to("mps"), fast_ln itself
+        # is on MPS. Calling fast_ln(x_cpu) would then pass a CPU input to an
+        # MPS module — device mismatch in C++ → segfault.
+        # Fix: create dedicated CPU and MPS module instances from the start.
+        ref_ln = nn.LayerNorm(C)                   # reference weights (CPU)
+        fast_ln_cpu = FastLayerNorm(C)              # CPU module stays on CPU
+        fast_ln_mps = FastLayerNorm(C).to(device)  # separate MPS module
+        pt_ln_mps   = nn.LayerNorm(C).to(device)
+        with torch.no_grad():
+            fast_ln_cpu.weight.copy_(ref_ln.weight)
+            fast_ln_cpu.bias.copy_(ref_ln.bias)
+            fast_ln_mps.weight.copy_(ref_ln.weight.to(device))
+            fast_ln_mps.bias.copy_(ref_ln.bias.to(device))
+            pt_ln_mps.weight.copy_(ref_ln.weight.to(device))
+            pt_ln_mps.bias.copy_(ref_ln.bias.to(device))
+
+        # CPU baseline (fast_ln_cpu is strictly on CPU — no device mismatch)
+        with torch.no_grad():
+            cpu_ms = benchmark(lambda: fast_ln_cpu(x_cpu), runs=RUNS, warmup=WARMUP)
+
+        # MPS timing uses torch.mps.synchronize() for accurate GPU measurement
+        def time_mps(fn, runs=RUNS, warmup=WARMUP):
+            with torch.no_grad():
+                for _ in range(warmup):
+                    fn()
+                torch.mps.synchronize()
+                t0 = time.perf_counter()
+                for _ in range(runs):
+                    fn()
+                torch.mps.synchronize()
+                return (time.perf_counter() - t0) * 1000 / runs
+
+        pt_mps_ms   = time_mps(lambda: pt_ln_mps(x_mps))
+        fast_mps_ms = time_mps(lambda: fast_ln_mps(x_mps))  # our Metal kernel
+
+        speedup_vs_cpu = cpu_ms / fast_mps_ms
+        speedup_vs_pt  = pt_mps_ms / fast_mps_ms
+        print(f"  LayerNorm {str((N,C)):<14} | CPU {cpu_ms:.3f}ms | "
+              f"PT-MPS {pt_mps_ms:.3f}ms | Ours-MPS {fast_mps_ms:.3f}ms | "
+              f"vs PT-MPS {speedup_vs_pt:.2f}x | vs CPU {speedup_vs_cpu:.2f}x")
+
+
 if __name__ == "__main__":
     print("\ntorchfast vs PyTorch CPU benchmark\n")
     _header()
@@ -139,3 +246,21 @@ if __name__ == "__main__":
     bench_attention()
     bench_focal_loss()
     print()
+
+    import torch
+    if torch.backends.mps.is_available():
+        print("\ntorchfast LayerNorm: MPS (Apple Silicon GPU) benchmark\n")
+        bench_layer_norm_mps()
+        print()
+    else:
+        print("\n(No MPS GPU — Apple Silicon GPU benchmark skipped)")
+
+    import torch
+    if torch.cuda.is_available():
+        print(f"\ntorchfast vs PyTorch GPU benchmark  [{torch.cuda.get_device_name(0)}]\n")
+        _header()
+        bench_layer_norm_cuda()
+        print()
+    else:
+        print("\n(No CUDA GPU detected — GPU benchmark skipped)")
+        print("To run GPU benchmarks: execute on a machine with an NVIDIA GPU")
